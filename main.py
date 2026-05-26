@@ -5,6 +5,7 @@ Flask + Supabase + Telegram Webhook
 Endpoints:
   POST /webhook/telegram        — Telegram updates
   POST /cron/send-reminders     — 24-hour appointment reminders
+  POST /cron/recover-slots      — Slot recovery with waitlist
   POST /cron/weekly-report      — Weekly stats per clinic → owner
   POST /cron/run-billing        — Mark completed appointments billed
   POST /cron/log-masterdata     — Snapshot all table counts
@@ -25,8 +26,8 @@ import telegram_api as tg
 # ---------------------------------------------------------------------------
 
 OWNER_CHAT_ID = "5174408636"
-WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "https://your-app.onrender.com")
-DEFAULT_BILL_AMOUNT = 500.0  # ETB — replace with real lookup if needed
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "https://dende.onrender.com")
+DEFAULT_BILL_AMOUNT = 500.0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -46,11 +47,11 @@ app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
 # In-memory registration session store
-# (Replace with Redis or DB column for multi-instance deployments)
 # ---------------------------------------------------------------------------
-# Structure: { chat_id: { "step": str, "data": dict } }
+
 _sessions: dict[str, dict] = {}
 
+STEP_AWAIT_LANGUAGE   = "await_language"
 STEP_AWAIT_FIRST_NAME = "await_first_name"
 STEP_AWAIT_LAST_NAME  = "await_last_name"
 STEP_AWAIT_PHONE      = "await_phone"
@@ -115,7 +116,6 @@ def webhook_telegram():
     except Exception as e:
         logger.error(f"webhook_telegram unhandled error: {e}", exc_info=True)
 
-    # Always return 200 so Telegram doesn't retry
     return jsonify({"ok": True}), 200
 
 
@@ -124,15 +124,23 @@ def webhook_telegram():
 # ---------------------------------------------------------------------------
 
 def _handle_start(chat_id: str, user: dict) -> None:
-    """Begin registration flow or greet returning patient."""
+    """Begin registration flow with language selection."""
     try:
         existing = db.get_patient_by_chat_id(chat_id)
         if existing:
             tg.send_message(chat_id, tg.msg_already_registered(existing.get("first_name", "")))
             return
 
-        set_session(chat_id, STEP_AWAIT_FIRST_NAME)
-        tg.send_message(chat_id, tg.msg_welcome(user.get("first_name", "ታካሚ")))
+        # Ask for language preference first
+        set_session(chat_id, STEP_AWAIT_LANGUAGE, {"first_name": user.get("first_name", "")})
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "🇪🇹 አማርኛ", "callback_data": "lang_am"}],
+                [{"text": "🇬🇧 English", "callback_data": "lang_en"}],
+                [{"text": "🌍 Afaan Oromoo", "callback_data": "lang_or"}]
+            ]
+        }
+        tg.send_message(chat_id, "ቋንቋ ይምረጡ | Choose language | Afaan filadhu:", reply_markup=keyboard)
     except Exception as e:
         logger.error(f"_handle_start error: {e}")
 
@@ -143,23 +151,34 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
         session = get_session(chat_id)
         step    = session.get("step", "")
         data    = session.get("data", {})
+        lang    = data.get("language", "am")
 
         if step == STEP_AWAIT_FIRST_NAME:
             data["first_name"] = text
             set_session(chat_id, STEP_AWAIT_LAST_NAME, data)
-            tg.send_message(chat_id, tg.msg_ask_last_name())
+            prompts = {
+                'am': 'ስም ቤተሰብዎን ያስገቡ።',
+                'en': 'Please enter your last name.',
+                'or': 'Maqaa abbaa kee galchi.'
+            }
+            tg.send_message(chat_id, prompts.get(lang, prompts['am']))
 
         elif step == STEP_AWAIT_LAST_NAME:
             data["last_name"] = text
             set_session(chat_id, STEP_AWAIT_PHONE, data)
+            prompts = {
+                'am': 'ስልክ ቁጥርዎን ያስገቡ (ወይም ዝለል ይጫኑ)',
+                'en': 'Please enter your phone number (or press skip).',
+                'or': 'Lakkoofsa bilbilaa kee galchi (ykn skip jedhi).'
+            }
             tg.send_message(
                 chat_id,
-                tg.msg_ask_phone(),
-                reply_markup={"keyboard": [[{"text": "ዝለል"}]], "resize_keyboard": True, "one_time_keyboard": True},
+                prompts.get(lang, prompts['am']),
+                reply_markup={"keyboard": [[{"text": "ዝለል / Skip"}]], "resize_keyboard": True, "one_time_keyboard": True},
             )
 
         elif step == STEP_AWAIT_PHONE:
-            data["phone"] = None if text in ("ዝለል", "skip") else text
+            data["phone"] = None if text in ("ዝለል", "Skip", "skip", "ዝለል / Skip") else text
             clinics = db.get_all_clinics()
             if not clinics:
                 tg.send_message(chat_id, "⚠️ ምንም ክሊኒክ አልተገኘም። በኋላ ይሞክሩ።")
@@ -167,31 +186,36 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
                 return
             data["clinics"] = clinics
             set_session(chat_id, STEP_AWAIT_CLINIC, data)
-            buttons = [[{"text": str(i + 1)}] for i in range(len(clinics))]
+            buttons = [[{"text": f"{i+1}. {c['name']}"}] for i, c in enumerate(clinics)]
+            prompts = {
+                'am': 'እባክዎ ክሊኒክ ይምረጡ፦',
+                'en': 'Please select your clinic:',
+                'or': 'Kiliinika kee filadhu:'
+            }
             tg.send_message(
                 chat_id,
-                tg.msg_ask_clinic(clinics),
+                prompts.get(lang, prompts['am']),
                 reply_markup={"keyboard": buttons, "resize_keyboard": True, "one_time_keyboard": True},
             )
 
         elif step == STEP_AWAIT_CLINIC:
             clinics = data.get("clinics", [])
             try:
-                idx = int(text) - 1
+                idx = int(text.split(".")[0]) - 1
                 if idx < 0 or idx >= len(clinics):
                     raise ValueError
                 chosen_clinic = clinics[idx]
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, IndexError):
                 tg.send_message(chat_id, "⚠️ ትክክለኛ ቁጥር ያስገቡ።")
                 return
 
-            # --- Persist patient first, then send message ---
             patient = db.create_patient(
                 chat_id   = chat_id,
                 first_name= data.get("first_name", ""),
                 last_name = data.get("last_name", ""),
                 phone     = data.get("phone"),
                 clinic_id = chosen_clinic["id"],
+                language  = lang,
             )
             if not patient:
                 tg.send_message(chat_id, "⚠️ ምዝገባ አልተሳካም። እባክዎ ደግመው ይሞክሩ።")
@@ -199,17 +223,25 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
                 return
 
             set_session(chat_id, STEP_REGISTERED, {"patient_id": patient["id"]})
-            tg.send_message(
-                chat_id,
-                tg.msg_registration_complete(data.get("first_name", ""), chosen_clinic.get("name", "")),
-            )
+            messages = {
+                'am': f'✅ ምዝገባዎ ተጠናቋል!\n\nእንኳን ደህና መጡ {data.get("first_name", "")}!\n🏥 {chosen_clinic.get("name", "")}',
+                'en': f'✅ Registration complete!\n\nWelcome {data.get("first_name", "")}!\n🏥 {chosen_clinic.get("name", "")}',
+                'or': f'✅ Galmaheen kee xumurame!\n\nBaga nagaan dhufte {data.get("first_name", "")}!\n🏥 {chosen_clinic.get("name", "")}'
+            }
+            tg.send_message(chat_id, messages.get(lang, messages['am']))
 
         else:
-            # Not in registration flow — unknown free text
             existing = db.get_patient_by_chat_id(chat_id)
             if not existing:
-                set_session(chat_id, STEP_AWAIT_FIRST_NAME)
-                tg.send_message(chat_id, tg.msg_welcome(user.get("first_name", "ታካሚ")))
+                set_session(chat_id, STEP_AWAIT_LANGUAGE, {"first_name": user.get("first_name", "")})
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "🇪🇹 አማርኛ", "callback_data": "lang_am"}],
+                        [{"text": "🇬🇧 English", "callback_data": "lang_en"}],
+                        [{"text": "🌍 Afaan Oromoo", "callback_data": "lang_or"}]
+                    ]
+                }
+                tg.send_message(chat_id, "ቋንቋ ይምረጡ | Choose language | Afaan filadhu:", reply_markup=keyboard)
             else:
                 tg.send_message(chat_id, tg.msg_unknown())
 
@@ -242,13 +274,18 @@ def _handle_cancel_appointment(chat_id: str) -> None:
             tg.send_message(chat_id, "ℹ️ ምንም ቀጠሮ አልተገኘም።")
             return
 
-        # Update DB first
         db.get_client().table("appointments").update({
             "status": "cancelled",
             "cancelled_at": db.now_utc(),
         }).eq("id", appt["id"]).execute()
 
-        tg.send_message(chat_id, "✅ ቀጠሮዎ ተሰርዟል። ሌላ ቀጠሮ ለማስያዝ /appointment ይጻፉ።")
+        lang = patient.get("language", "am")
+        messages = {
+            'am': '✅ ቀጠሮዎ ተሰርዟል። /appointment በመጻፍ አዲስ ቀጠሮ ይያዙ።',
+            'en': '✅ Your appointment has been cancelled. Use /appointment to book a new one.',
+            'or': '✅ Beellamni kee haqameera. /appointment fayyadamiitii beellama haaraa qabadhu.'
+        }
+        tg.send_message(chat_id, messages.get(lang, messages['am']))
     except Exception as e:
         logger.error(f"_handle_cancel_appointment error: {e}")
 
@@ -260,10 +297,13 @@ def _handle_book_appointment(chat_id: str) -> None:
         if not patient:
             tg.send_message(chat_id, "⚠️ ምዝገባ አልተገኘም። /start ይፃፉ።")
             return
-        tg.send_message(
-            chat_id,
-            "📅 ቀጠሮ ለማስያዝ ከክሊኒኩ ጋር ያነጋግሩ ወይም ቁጥር ይደውሉ። ቅርብ ጊዜ ቀጠሮ ቦታ ሲገኝ እናሳውቅዎ።",
-        )
+        lang = patient.get("language", "am")
+        messages = {
+            'am': '📅 ቀጠሮ ለማስያዝ ክሊኒኩን ያነጋግሩ። ቦታ ሲገኝ እናሳውቅዎታለን።',
+            'en': '📅 Please contact the clinic to book an appointment. We will notify you when a slot opens.',
+            'or': '📅 Beellama qabadhuuf kiliinikaa qunnamaa. Yeroo bakki argamu isin beeksifna.'
+        }
+        tg.send_message(chat_id, messages.get(lang, messages['am']))
     except Exception as e:
         logger.error(f"_handle_book_appointment error: {e}")
 
@@ -289,22 +329,30 @@ def _handle_status(chat_id: str) -> None:
             .execute()
         )
         appt = res.data[0] if res.data else None
+        lang = patient.get("language", "am")
         if not appt:
-            tg.send_message(chat_id, "ℹ️ ምንም ቀጠሮ አልተገኘም።")
+            messages = {
+                'am': 'ℹ️ ምንም ቀጠሮ አልተገኘም።',
+                'en': 'ℹ️ No appointments found.',
+                'or': "ℹ️ Beellamni hin argamne."
+            }
+            tg.send_message(chat_id, messages.get(lang, messages['am']))
             return
 
         clinic_name = (appt.get("clinics") or {}).get("name", "ክሊኒክ")
         appt_time   = appt.get("appointment_time", "—")
-        tg.send_message(
-            chat_id,
-            f"📅 <b>ቀጣዩ ቀጠሮዎ:</b>\n\n🏥 {clinic_name}\n🕐 {appt_time}",
-        )
+        messages = {
+            'am': f'📅 <b>ቀጣዩ ቀጠሮዎ:</b>\n\n🏥 {clinic_name}\n🕐 {appt_time}',
+            'en': f'📅 <b>Your next appointment:</b>\n\n🏥 {clinic_name}\n🕐 {appt_time}',
+            'or': f'📅 <b>Beellamni kee itti aanu:</b>\n\n🏥 {clinic_name}\n🕐 {appt_time}'
+        }
+        tg.send_message(chat_id, messages.get(lang, messages['am']))
     except Exception as e:
         logger.error(f"_handle_status error: {e}")
 
 
 def _handle_callback_query(callback_query: dict) -> None:
-    """Handle inline button presses (e.g., waitlist slot claim)."""
+    """Handle inline button presses (language choice, waitlist slot claim)."""
     try:
         cq_id   = callback_query["id"]
         data    = callback_query.get("data", "")
@@ -312,19 +360,34 @@ def _handle_callback_query(callback_query: dict) -> None:
 
         tg.answer_callback_query(cq_id)
 
+        # --- Language selection ---
+        if data.startswith("lang_"):
+            language_code = data.replace("lang_", "")
+            session = get_session(chat_id)
+            session_data = session.get("data", {})
+            first_name = session_data.get("first_name", "ታካሚ")
+            
+            set_session(chat_id, STEP_AWAIT_FIRST_NAME, {"language": language_code, "first_name": first_name})
+            
+            welcome_messages = {
+                'am': f'ተመዝግበዋል! እንኳን ደህና መጡ {first_name}! 🦷\n\nስምዎን ያስገቡ።\n\n— ዴንዴ ፕላቲነም',
+                'en': f'Registered! Welcome {first_name}! 🦷\n\nPlease enter your first name.\n\n— Dende Platinum',
+                'or': f"Galmaa'e! Baga nagaan dhufte {first_name}! 🦷\n\nMaqaa kee galchi.\n\n— Dende Platinum"
+            }
+            tg.send_message(chat_id, welcome_messages.get(language_code, welcome_messages['am']))
+            return
+
+        # --- Slot claim ---
         if data.startswith("claim_slot:"):
-            # data format: "claim_slot:<waitlist_id>:<appointment_id>:<slot_time_iso>"
             parts = data.split(":", 3)
             if len(parts) < 4:
                 return
             _, waitlist_id, appointment_id, slot_time = parts
 
-            # Atomic claim — update DB before sending confirmation
             claimed = db.atomic_claim_waitlist_slot(waitlist_id, slot_time)
             if claimed:
                 patient = db.get_patient_by_chat_id(chat_id)
                 if patient:
-                    # Create replacement appointment
                     db.create_appointment(
                         patient_id=patient["id"],
                         clinic_id=patient.get("clinic_id", ""),
@@ -342,6 +405,10 @@ def _handle_callback_query(callback_query: dict) -> None:
             else:
                 tg.send_message(chat_id, tg.msg_slot_already_taken())
 
+        # --- Decline slot ---
+        elif data == "decline_slot":
+            tg.send_message(chat_id, "እሺ፣ ተረድቻለሁ። ሌላ ቀጠሮ ሲገኝ እናሳውቅዎታለን።")
+
     except Exception as e:
         logger.error(f"_handle_callback_query error: {e}")
 
@@ -352,10 +419,7 @@ def _handle_callback_query(callback_query: dict) -> None:
 
 @app.route("/cron/send-reminders", methods=["POST"])
 def cron_send_reminders():
-    """
-    Called by an external scheduler (e.g., Render cron jobs, GitHub Actions).
-    Sends Amharic reminder messages for appointments within the next 24 hours.
-    """
+    """Sends reminder messages for appointments within the next 24 hours."""
     sent = 0
     failed = 0
     try:
@@ -368,21 +432,25 @@ def cron_send_reminders():
                 first_name  = patient.get("first_name", "ታካሚ")
                 clinic_name = clinic.get("name", "ክሊኒክ")
                 appt_time   = appt.get("appointment_time", "—")
+                lang        = patient.get("language", "am")
 
                 if not chat_id:
                     failed += 1
                     continue
 
-                # IMPORTANT: mark reminded in DB before sending message
                 updated = db.mark_appointment_reminded(appt["id"])
                 if not updated:
                     failed += 1
                     continue
 
-                result = tg.send_message(
-                    chat_id,
-                    tg.msg_appointment_reminder(first_name, clinic_name, appt_time),
-                )
+                reminder_messages = {
+                    'am': f'ሰላም {first_name}! ነገ በ{appt_time} በ{clinic_name} ቀጠሮ አለዎት። እንደምትመጡ ተስፋ እናደርጋለን!',
+                    'en': f'Hello {first_name}! You have an appointment tomorrow at {appt_time} at {clinic_name}. We look forward to seeing you!',
+                    'or': f'Akkam {first_name}! Boru sa\'a {appt_time} irratti {clinic_name} beellama qabda. Isin arguu hawwina!'
+                }
+                msg = reminder_messages.get(lang, reminder_messages['am'])
+
+                result = tg.send_message(chat_id, msg)
                 if result:
                     sent += 1
                 else:
@@ -400,16 +468,12 @@ def cron_send_reminders():
 
 
 # ---------------------------------------------------------------------------
-# Cron: Slot Recovery with waitlist + atomic claims
+# Cron: Slot Recovery
 # ---------------------------------------------------------------------------
 
 @app.route("/cron/recover-slots", methods=["POST"])
 def cron_recover_slots():
-    """
-    For each clinic, find today's cancelled slots and offer them to the
-    next person on the waitlist via an inline keyboard.
-    Atomic claim prevents double-booking.
-    """
+    """Find today's cancelled slots and offer them to waitlist patients."""
     offered = 0
     try:
         clinics = db.get_all_clinics()
@@ -432,7 +496,6 @@ def cron_recover_slots():
                         if not chat_id:
                             continue
 
-                        # Mark as offered (DB first)
                         db.mark_slot_recovery_offered(slot["id"])
 
                         inline_buttons = [[
@@ -467,9 +530,7 @@ def cron_recover_slots():
 
 @app.route("/cron/weekly-report", methods=["POST"])
 def cron_weekly_report():
-    """
-    Computes last 7 days stats per clinic and sends a summary to OWNER_CHAT_ID.
-    """
+    """Computes last 7 days stats per clinic and sends a summary."""
     try:
         now       = datetime.now(timezone.utc)
         week_ago  = (now - timedelta(days=7)).isoformat()
@@ -514,10 +575,7 @@ def cron_weekly_report():
 
 @app.route("/cron/run-billing", methods=["POST"])
 def cron_run_billing():
-    """
-    Mark all completed-but-unbilled appointments as billed and
-    notify the owner with a per-clinic summary.
-    """
+    """Mark all completed-but-unbilled appointments as billed."""
     try:
         clinics     = db.get_all_clinics()
         total_billed = 0
@@ -534,7 +592,6 @@ def cron_run_billing():
                 for appt in unbilled:
                     try:
                         amount = appt.get("fee", DEFAULT_BILL_AMOUNT) or DEFAULT_BILL_AMOUNT
-                        # Update DB before notifying
                         success = db.mark_appointment_billed(appt["id"], float(amount))
                         if success:
                             billed_count  += 1
@@ -565,7 +622,7 @@ def cron_run_billing():
 
 @app.route("/cron/log-masterdata", methods=["POST"])
 def cron_log_masterdata():
-    """Snapshot all key table counts into master_data for dashboards / audits."""
+    """Snapshot all key table counts into master_data."""
     try:
         snapshot = db.get_master_data_snapshot()
         if not snapshot:
@@ -597,7 +654,7 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Webhook setup (call once after deploy)
+# Webhook setup
 # ---------------------------------------------------------------------------
 
 @app.route("/setup-webhook", methods=["GET"])
