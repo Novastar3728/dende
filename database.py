@@ -10,8 +10,7 @@ from supabase import create_client, Client
 logger = logging.getLogger(__name__)
 
 SUPABASE_URL = "https://wjcmvfdlnqvtckssswht.supabase.co"
-SUPABASE_KEY = "sb_secret_vLvzADMIbwDXRSMq1VruEQ_6X2gj_ON"
-
+SUPABASE_KEY = "sb_secret_oWTaagovsY5gaLhrhpQoKw_3Wn8zbZt"
 # ---------------------------------------------------------------------------
 # Client singleton
 # ---------------------------------------------------------------------------
