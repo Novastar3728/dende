@@ -90,6 +90,44 @@ def test_db():
 
 
 # ---------------------------------------------------------------------------
+# Cron: Send 24-hour reminders
+# ---------------------------------------------------------------------------
+
+@app.route("/cron/send-reminders", methods=["GET", "POST"])
+def cron_send_reminders():
+    try:
+        client = get_supabase()
+        now = datetime.now(timezone.utc)
+        tomorrow = now + timedelta(hours=24)
+        
+        res = client.table("appointments").select("*").eq("reminder_sent", False).eq("status", "PENDING").execute()
+        
+        sent = 0
+        for appt in res.data or []:
+            appt_time = datetime.fromisoformat(appt["appointment_time"].replace("Z", "+00:00"))
+            if now <= appt_time <= tomorrow:
+                chat_id = appt.get("phone", "")
+                if not chat_id:
+                    continue
+                
+                patient_name = appt.get("patient_name", "ታካሚ")
+                clinic_name = "Test Clinic"
+                local_time = appt_time.strftime("%H:%M")
+                
+                msg = f'ሰላም {patient_name}! ነገ በ{local_time} በ{clinic_name} ቀጠሮ አለዎት። እንደምትመጡ ተስፋ እናደርጋለን!'
+                
+                tg.send_message(chat_id, msg)
+                
+                client.table("appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
+                sent += 1
+        
+        return jsonify({"ok": True, "sent": sent})
+    except Exception as e:
+        logger.error(f"cron_send_reminders error: {e}")
+        return jsonify({"ok": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------------------
 # Webhook — Telegram update handler
 # ---------------------------------------------------------------------------
 
@@ -135,7 +173,6 @@ def webhook_telegram():
 def _handle_start(chat_id: str, user: dict) -> None:
     """Begin registration flow with language selection."""
     try:
-        # Try database first
         try:
             client = get_supabase()
             res = client.table("patients").select("*").eq("chat_id", chat_id).limit(1).execute()
@@ -145,7 +182,6 @@ def _handle_start(chat_id: str, user: dict) -> None:
         except Exception as db_err:
             logger.warning(f"DB lookup failed, continuing without it: {db_err}")
 
-        # Ask for language preference
         set_session(chat_id, STEP_AWAIT_LANGUAGE, {"first_name": user.get("first_name", "")})
         keyboard = {
             "inline_keyboard": [
@@ -191,7 +227,6 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
 
         elif step == STEP_AWAIT_PHONE:
             data["phone"] = None if text in ("ዝለል", "Skip", "skip", "ዝለል / Skip") else text
-            # Try to get clinics from database, fallback to hardcoded list
             clinics = []
             try:
                 client = get_supabase()
@@ -225,7 +260,6 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
                 tg.send_message(chat_id, "⚠️ ትክክለኛ ቁጥር ያስገቡ።")
                 return
 
-            # Try to save to database, but don't fail if it doesn't work
             try:
                 client = get_supabase()
                 client.table("patients").insert({
