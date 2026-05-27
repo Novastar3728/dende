@@ -1,5 +1,0 @@
-SUPABASE_URL = "https://wjcmvfdlnqvtckssswht.supabase.co"
-SUPABASE_KEY = "sb_secret_vLvzADMIbwDXRSMq1VruEQ_6X2gj_ON"
-TELEGRAM_BOT_TOKEN = "8578932007:AAHK-ba9EY8s1Sqa2IWV4FzVJVx5F6WsdgU"
-OWNER_CHAT_ID = "5174408636"
-WEBHOOK_BASE_URL = "https://your-app.onrender.com"
