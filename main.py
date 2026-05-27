@@ -327,7 +327,7 @@ def _handle_callback_query(callback_query: dict) -> None:
 def health():
     return jsonify({
         "ok": True,
-        "service": "dende-bot",
+        "service": "dende-bot-v2",
     }), 200
 
 
