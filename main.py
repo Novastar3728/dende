@@ -20,7 +20,7 @@ WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "https://dende.onrender.co
 DEFAULT_BILL_AMOUNT = 500.0
 
 SUPABASE_URL = "https://wjcmvfdlnqvtckssswht.supabase.co"
-SUPABASE_KEY = "sb_secret_oWTaagovsY5gaLhrhpQoKw_3Wn8zbZt"
+SUPABASE_KEY = "sb_secret_gPDjSf4vpyT8yw0VQ6XX5A_qGIa0xN8"
 
 # ---------------------------------------------------------------------------
 # Logging
