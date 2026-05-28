@@ -123,7 +123,16 @@ def cron_send_reminders():
                     
                     msg = f'ሰላም {patient_name}! ነገ በ{local_time} በ{clinic_name} ቀጠሮ አለዎት። እንደምትመጡ ተስፋ እናደርጋለን!'
                     
-                    tg.send_message(chat_id, msg)
+                    keyboard = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "✅ አዎ / Confirm", "callback_data": f"confirm_{appt['id']}"},
+                                {"text": "❌ አይ / Cancel", "callback_data": f"cancel_{appt['id']}"}
+                            ]
+                        ]
+                    }
+                    
+                    tg.send_message(chat_id, msg, reply_markup=keyboard)
                     
                     client.table("appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
                     sent += 1
@@ -310,6 +319,29 @@ def _handle_callback_query(callback_query: dict) -> None:
 
         tg.answer_callback_query(cq_id)
 
+        # --- Confirm appointment ---
+        if data.startswith("confirm_"):
+            appt_id = data.replace("confirm_", "")
+            try:
+                client = get_supabase()
+                client.table("appointments").update({"status": "CONFIRMED", "confirmed": True}).eq("id", appt_id).execute()
+                tg.send_message(chat_id, "✅ ቀጠሮዎ ተረጋግጧል! እናመሰግናለን!")
+            except Exception as e:
+                logger.error(f"confirm error: {e}")
+            return
+
+        # --- Cancel appointment ---
+        if data.startswith("cancel_"):
+            appt_id = data.replace("cancel_", "")
+            try:
+                client = get_supabase()
+                client.table("appointments").update({"status": "CANCELLED"}).eq("id", appt_id).execute()
+                tg.send_message(chat_id, "❌ ቀጠሮዎ ተሰርዟል። ሌላ ቀጠሮ ለማስያዝ ክሊኒኩን ያነጋግሩ።")
+            except Exception as e:
+                logger.error(f"cancel error: {e}")
+            return
+
+        # --- Language selection ---
         if data.startswith("lang_"):
             language_code = data.replace("lang_", "")
             session = get_session(chat_id)
