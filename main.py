@@ -40,10 +40,9 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 
 def get_supabase():
-    return create_client(
-        "https://wjcmvfdlnqvtckssswht.supabase.co",
-        "sb_secret_gPDjSf4vpyT8yw0VQ6XX5A_qGIa0xN8"
-    )
+    url = os.environ.get("SUPABASE_URL", "https://wjcmvfdlnqvtckssswht.supabase.co")
+    key = os.environ.get("SUPABASE_KEY", "")
+    return create_client(url, key)
 
 # ---------------------------------------------------------------------------
 # In-memory registration session store
