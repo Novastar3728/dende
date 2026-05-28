@@ -19,9 +19,6 @@ OWNER_CHAT_ID = "5174408636"
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "https://dende.onrender.com")
 DEFAULT_BILL_AMOUNT = 500.0
 
-SUPABASE_URL = "https://wjcmvfdlnqvtckssswht.supabase.co"
-SUPABASE_KEY = "sb_secret_gPDjSf4vpyT8yw0VQ6XX5A_qGIa0xN8"
-
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -43,7 +40,10 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 
 def get_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    return create_client(
+        "https://wjcmvfdlnqvtckssswht.supabase.co",
+        "sb_secret_gPDjSf4vpyT8yw0VQ6XX5A_qGIa0xN8"
+    )
 
 # ---------------------------------------------------------------------------
 # In-memory registration session store
