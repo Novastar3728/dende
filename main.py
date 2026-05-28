@@ -92,16 +92,23 @@ def test_db():
 # Cron: Send 24-hour reminders
 # ---------------------------------------------------------------------------
 
+@app.route("/cron/send-reminders", methods=["GET", "POST"])
+def cron_send_reminders():
+    try:
+        client = get_supabase()
+        now = datetime.now(timezone.utc)
+        tomorrow = now + timedelta(hours=24)
+        
+        res = client.table("appointments").select("*").eq("reminder_sent", False).eq("status", "PENDING").execute()
+        
         sent = 0
         for appt in res.data or []:
             try:
                 appt_time_str = appt["appointment_time"]
-                # Handle both timezone-aware and naive timestamps
                 if "T" in appt_time_str:
                     appt_time = datetime.fromisoformat(appt_time_str.replace("Z", "+00:00"))
                 else:
                     appt_time = datetime.fromisoformat(appt_time_str)
-                # Make appt_time offset-naive for comparison
                 if appt_time.tzinfo is not None:
                     appt_time = appt_time.replace(tzinfo=None)
                 
@@ -112,7 +119,6 @@ def test_db():
                     
                     patient_name = appt.get("patient_name", "ታካሚ")
                     clinic_name = "Test Clinic"
-                    # Convert to Ethiopian time for display
                     local_time = appt_time.strftime("%H:%M")
                     
                     msg = f'ሰላም {patient_name}! ነገ በ{local_time} በ{clinic_name} ቀጠሮ አለዎት። እንደምትመጡ ተስፋ እናደርጋለን!'
@@ -124,6 +130,12 @@ def test_db():
             except Exception as inner_e:
                 logger.error(f"Error processing appointment {appt.get('id')}: {inner_e}")
                 continue
+        
+        return jsonify({"ok": True, "sent": sent})
+    except Exception as e:
+        logger.error(f"cron_send_reminders error: {e}")
+        return jsonify({"ok": False, "error": str(e)})
+
 
 # ---------------------------------------------------------------------------
 # Webhook — Telegram update handler
