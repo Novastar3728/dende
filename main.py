@@ -99,11 +99,20 @@ def cron_send_reminders():
         now = datetime.now(timezone.utc)
         tomorrow = now + timedelta(hours=24)
         
+        # Only send reminders for clinics with Active or Grace status
+        clinics = client.table("clinics").select("*").execute()
+        active_clinic_ids = [c["id"] for c in (clinics.data or []) if c.get("payment_status") in ("Active", "Grace")]
+        
         res = client.table("appointments").select("*").eq("reminder_sent", False).eq("status", "PENDING").execute()
         
         sent = 0
         for appt in res.data or []:
             try:
+                # Skip if clinic is expired
+                clinic_id = appt.get("clinic_id", "")
+                if clinic_id and clinic_id not in active_clinic_ids:
+                    continue
+                
                 appt_time_str = appt["appointment_time"]
                 if "T" in appt_time_str:
                     appt_time = datetime.fromisoformat(appt_time_str.replace("Z", "+00:00"))
@@ -143,6 +152,139 @@ def cron_send_reminders():
         return jsonify({"ok": True, "sent": sent})
     except Exception as e:
         logger.error(f"cron_send_reminders error: {e}")
+        return jsonify({"ok": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Cron: Billing Engine
+# ---------------------------------------------------------------------------
+
+@app.route("/cron/run-billing", methods=["GET", "POST"])
+def cron_run_billing():
+    try:
+        client = get_supabase()
+        today = datetime.now(timezone.utc).date()
+        
+        res = client.table("clinics").select("*").execute()
+        
+        notified = 0
+        for clinic in res.data or []:
+            next_payment = clinic.get("next_payment_date")
+            if not next_payment:
+                continue
+            
+            if isinstance(next_payment, str):
+                next_payment = datetime.fromisoformat(next_payment).date()
+            
+            days_left = (next_payment - today).days
+            clinic_id = clinic["id"]
+            clinic_name = clinic.get("name", "Clinic")
+            owner_chat_id = clinic.get("owner_chat_id", "")
+            monthly_fee = clinic.get("monthly_fee", 10000)
+            
+            if not owner_chat_id:
+                continue
+            
+            # Update days_remaining
+            client.table("clinics").update({"days_remaining": days_left}).eq("id", clinic_id).execute()
+            
+            # Send appropriate message
+            if days_left == 7:
+                msg = f'ሰላም! የ{clinic_name} የዴንዴ ፕላቲነም ምዝገባ በ7 ቀናት ውስጥ ያበቃል። {monthly_fee} ብር ይክፈሉ።'
+                tg.send_message(owner_chat_id, msg)
+                notified += 1
+            elif days_left == 3:
+                msg = f'አስቸኳይ! የ{clinic_name} ምዝገባ በ3 ቀናት ያበቃል! {monthly_fee} ብር ይክፈሉ።'
+                tg.send_message(owner_chat_id, msg)
+                notified += 1
+            elif days_left == 1:
+                msg = f'ማስጠንቀቂያ! የ{clinic_name} ምዝገባ ነገ ያበቃል! {monthly_fee} ብር ዛሬ ይክፈሉ።'
+                tg.send_message(owner_chat_id, msg)
+                notified += 1
+            elif days_left == 0:
+                client.table("clinics").update({"payment_status": "Grace"}).eq("id", clinic_id).execute()
+                msg = f'የ{clinic_name} ምዝገባ አብቅቷል። አገልግሎቱ ቆሟል። ለማደስ {monthly_fee} ብር ይክፈሉና "PAID" ብለው ይላኩ።'
+                tg.send_message(owner_chat_id, msg)
+                tg.send_message(OWNER_CHAT_ID, f'🚨 {clinic_name} subscription expired!')
+                notified += 1
+            elif days_left <= -5:
+                client.table("clinics").update({"payment_status": "Expired"}).eq("id", clinic_id).execute()
+                msg = f'የ{clinic_name} ምዝገባ ሙሉ በሙሉ ተሰርዟል።'
+                tg.send_message(owner_chat_id, msg)
+                notified += 1
+        
+        return jsonify({"ok": True, "notified": notified})
+    except Exception as e:
+        logger.error(f"cron_run_billing error: {e}")
+        return jsonify({"ok": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Cron: Weekly Report
+# ---------------------------------------------------------------------------
+
+@app.route("/cron/weekly-report", methods=["GET", "POST"])
+def cron_weekly_report():
+    try:
+        client = get_supabase()
+        
+        clinics = client.table("clinics").select("*").execute()
+        
+        for clinic in clinics.data or []:
+            clinic_id = clinic["id"]
+            clinic_name = clinic.get("name", "Clinic")
+            owner_chat_id = clinic.get("owner_chat_id", "")
+            
+            if not owner_chat_id:
+                continue
+            
+            appts = client.table("appointments").select("*").eq("clinic_id", clinic_id).execute()
+            
+            total = len(appts.data or [])
+            confirmed = sum(1 for a in (appts.data or []) if a.get("status") == "CONFIRMED" or a.get("confirmed"))
+            cancelled = sum(1 for a in (appts.data or []) if a.get("status") == "CANCELLED")
+            pending = sum(1 for a in (appts.data or []) if a.get("status") == "PENDING")
+            
+            report = f'📊 የ{clinic_name} ሳምንታዊ ሪፖርት\n\n📅 ጠቅላላ ቀጠሮዎች: {total}\n✅ የተረጋገጡ: {confirmed}\n❌ የተሰረዙ: {cancelled}\n⏳ በመጠባበቅ: {pending}\n\n— ዴንዴ ፕላቲነም'
+            
+            tg.send_message(owner_chat_id, report)
+        
+        return jsonify({"ok": True, "clinics_reported": len(clinics.data or [])})
+    except Exception as e:
+        logger.error(f"cron_weekly_report error: {e}")
+        return jsonify({"ok": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Cron: Master Data Logger
+# ---------------------------------------------------------------------------
+
+@app.route("/cron/log-masterdata", methods=["GET", "POST"])
+def cron_log_masterdata():
+    try:
+        client = get_supabase()
+        today = datetime.now(timezone.utc).date().isoformat()
+        
+        clinics = client.table("clinics").select("*").execute()
+        active_count = sum(1 for c in (clinics.data or []) if c.get("payment_status") in ("Active", "Grace"))
+        
+        for clinic in clinics.data or []:
+            appts = client.table("appointments").select("*").eq("clinic_id", clinic["id"]).execute()
+            reminders = sum(1 for a in (appts.data or []) if a.get("reminder_sent"))
+            
+            client.table("master_data").insert({
+                "date": today,
+                "clinic_id": clinic["id"],
+                "clinic_name": clinic.get("name", ""),
+                "reminders_sent": reminders,
+                "slots_recovered": 0,
+                "revenue_recovered": 0,
+                "active_clinics": active_count
+            }).execute()
+        
+        return jsonify({"ok": True, "date": today})
+    except Exception as e:
+        logger.error(f"cron_log_masterdata error: {e}")
         return jsonify({"ok": False, "error": str(e)})
 
 
@@ -223,6 +365,28 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
         data    = session.get("data", {})
         lang    = data.get("language", "am")
 
+        # --- Check for PAID confirmation ---
+        if "paid" in text.lower() or "ከፍያለሁ" in text:
+            try:
+                client = get_supabase()
+                res = client.table("clinics").select("*").eq("owner_chat_id", chat_id).execute()
+                if res.data:
+                    clinic = res.data[0]
+                    new_date = (datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat()
+                    client.table("clinics").update({
+                        "payment_status": "Active",
+                        "next_payment_date": new_date,
+                        "days_remaining": 30
+                    }).eq("id", clinic["id"]).execute()
+                    tg.send_message(chat_id, f'✅ ክፍያዎ ተቀብሏል! ምዝገባዎ እስከ {new_date} ቀጥሏል። እናመሰግናለን!')
+                    tg.send_message(OWNER_CHAT_ID, f'💰 {clinic["name"]} renewed for 30 days!')
+                else:
+                    tg.send_message(chat_id, "⚠️ ክሊኒክ አልተገኘም። እባክዎ የዴንዴ ቡድንን ያግኙ።")
+            except Exception as e:
+                logger.error(f"PAID handler error: {e}")
+            return
+
+        # --- Registration flow ---
         if step == STEP_AWAIT_FIRST_NAME:
             data["first_name"] = text
             set_session(chat_id, STEP_AWAIT_LAST_NAME, data)
