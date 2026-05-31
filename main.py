@@ -99,7 +99,6 @@ def cron_send_reminders():
         now = datetime.now(timezone.utc)
         tomorrow = now + timedelta(hours=24)
         
-        # Only send reminders for clinics with Active or Grace status
         clinics = client.table("clinics").select("*").execute()
         active_clinic_ids = [c["id"] for c in (clinics.data or []) if c.get("payment_status") in ("Active", "Grace")]
         
@@ -108,7 +107,6 @@ def cron_send_reminders():
         sent = 0
         for appt in res.data or []:
             try:
-                # Skip if clinic is expired
                 clinic_id = appt.get("clinic_id", "")
                 if clinic_id and clinic_id not in active_clinic_ids:
                     continue
@@ -185,10 +183,8 @@ def cron_run_billing():
             if not owner_chat_id:
                 continue
             
-            # Update days_remaining
             client.table("clinics").update({"days_remaining": days_left}).eq("id", clinic_id).execute()
             
-            # Send appropriate message
             if days_left == 7:
                 msg = f'ሰላም! የ{clinic_name} የዴንዴ ፕላቲነም ምዝገባ በ7 ቀናት ውስጥ ያበቃል። {monthly_fee} ብር ይክፈሉ።'
                 tg.send_message(owner_chat_id, msg)
@@ -244,8 +240,9 @@ def cron_weekly_report():
             confirmed = sum(1 for a in (appts.data or []) if a.get("status") == "CONFIRMED" or a.get("confirmed"))
             cancelled = sum(1 for a in (appts.data or []) if a.get("status") == "CANCELLED")
             pending = sum(1 for a in (appts.data or []) if a.get("status") == "PENDING")
+            recovered = sum(1 for a in (appts.data or []) if a.get("source") == "recovery")
             
-            report = f'📊 የ{clinic_name} ሳምንታዊ ሪፖርት\n\n📅 ጠቅላላ ቀጠሮዎች: {total}\n✅ የተረጋገጡ: {confirmed}\n❌ የተሰረዙ: {cancelled}\n⏳ በመጠባበቅ: {pending}\n\n— ዴንዴ ፕላቲነም'
+            report = f'📊 የ{clinic_name} ሳምንታዊ ሪፖርት\n\n📅 ጠቅላላ ቀጠሮዎች: {total}\n✅ የተረጋገጡ: {confirmed}\n❌ የተሰረዙ: {cancelled}\n🔄 የተመለሱ: {recovered}\n⏳ በመጠባበቅ: {pending}\n\n— ዴንዴ ፕላቲነም'
             
             tg.send_message(owner_chat_id, report)
         
@@ -271,13 +268,14 @@ def cron_log_masterdata():
         for clinic in clinics.data or []:
             appts = client.table("appointments").select("*").eq("clinic_id", clinic["id"]).execute()
             reminders = sum(1 for a in (appts.data or []) if a.get("reminder_sent"))
+            recovered = sum(1 for a in (appts.data or []) if a.get("source") == "recovery")
             
             client.table("master_data").insert({
                 "date": today,
                 "clinic_id": clinic["id"],
                 "clinic_name": clinic.get("name", ""),
                 "reminders_sent": reminders,
-                "slots_recovered": 0,
+                "slots_recovered": recovered,
                 "revenue_recovered": 0,
                 "active_clinics": active_count
             }).execute()
@@ -365,7 +363,6 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
         data    = session.get("data", {})
         lang    = data.get("language", "am")
 
-        # --- Check for PAID confirmation ---
         if "paid" in text.lower() or "ከፍያለሁ" in text:
             try:
                 client = get_supabase()
@@ -386,7 +383,6 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
                 logger.error(f"PAID handler error: {e}")
             return
 
-        # --- Registration flow ---
         if step == STEP_AWAIT_FIRST_NAME:
             data["first_name"] = text
             set_session(chat_id, STEP_AWAIT_LAST_NAME, data)
@@ -474,6 +470,87 @@ def _handle_text(chat_id: str, text: str, user: dict) -> None:
         tg.send_message(chat_id, "Something went wrong. Please try /start again.")
 
 
+# ---------------------------------------------------------------------------
+# Slot Recovery Engine
+# ---------------------------------------------------------------------------
+
+def _recover_slot(client, cancelled_appt):
+    """Find waitlisted patients and offer them the cancelled slot."""
+    try:
+        clinic_id = cancelled_appt.get("clinic_id", "")
+        cancelled_time_str = cancelled_appt.get("appointment_time", "")
+        cancelled_value = cancelled_appt.get("estimated_value", 0) or 0
+        cancelled_type = cancelled_appt.get("appointment_type", "ህክምና")
+        appt_id = cancelled_appt.get("id", "")
+        
+        if "T" in cancelled_time_str:
+            cancelled_time = datetime.fromisoformat(cancelled_time_str.replace("Z", "+00:00"))
+        else:
+            cancelled_time = datetime.fromisoformat(cancelled_time_str)
+        if cancelled_time.tzinfo is not None:
+            cancelled_time = cancelled_time.replace(tzinfo=None)
+        
+        waitlist = client.table("waitlist").select("*").eq("clinic_id", clinic_id).eq("status", "waiting").execute()
+        
+        matches = []
+        for entry in (waitlist.data or []):
+            preferred = entry.get("preferred_time", "")
+            entry_value = entry.get("procedure_value", 0) or 0
+            
+            if cancelled_value > 0 and entry_value < cancelled_value * 0.6:
+                continue
+            
+            if preferred:
+                try:
+                    preferred_time = datetime.strptime(preferred, "%H:%M")
+                    slot_hour = cancelled_time.hour
+                    pref_hour = preferred_time.hour
+                    if abs(slot_hour - pref_hour) > 2:
+                        continue
+                except:
+                    pass
+            
+            matches.append(entry)
+        
+        matches.sort(key=lambda x: (-(x.get("procedure_value", 0) or 0), x.get("date_added", "")))
+        
+        offered = 0
+        local_time = cancelled_time.strftime("%H:%M")
+        
+        for entry in matches[:3]:
+            patient_chat_id = entry.get("chat_id") or entry.get("phone", "")
+            if not patient_chat_id:
+                continue
+            
+            msg = f'መልካም ዜና! የ{entry.get("needed_procedure", cancelled_type)} ቀጠሮ ነገ በ{local_time} ባዶ ሆኗል።\n\nይህ ህክምና በተለምዶ {cancelled_value} ብር ያስከፍላል።\n\nለመያዝ ከታች ያለውን ቁልፍ ይጫኑ!'
+            
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "✅ ቦታውን ያዝ / Claim Slot", "callback_data": f"claim_{appt_id}_{entry['id']}"}]
+                ]
+            }
+            
+            tg.send_message(patient_chat_id, msg, reply_markup=keyboard)
+            
+            client.table("waitlist").update({"status": "offered"}).eq("id", entry["id"]).execute()
+            offered += 1
+        
+        if offered > 0:
+            clinic_name = "Clinic"
+            clinic_res = client.table("clinics").select("name").eq("id", clinic_id).execute()
+            if clinic_res.data:
+                clinic_name = clinic_res.data[0].get("name", "Clinic")
+            
+            tg.send_message(OWNER_CHAT_ID, f'📢 {offered} slot recovery offers sent for {clinic_name} - {cancelled_type} worth {cancelled_value} Birr')
+    
+    except Exception as e:
+        logger.error(f"_recover_slot error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Callback query handler
+# ---------------------------------------------------------------------------
+
 def _handle_callback_query(callback_query: dict) -> None:
     """Handle inline button presses."""
     try:
@@ -482,6 +559,43 @@ def _handle_callback_query(callback_query: dict) -> None:
         chat_id = str(callback_query["from"]["id"])
 
         tg.answer_callback_query(cq_id)
+
+        # --- Claim recovered slot ---
+        if data.startswith("claim_"):
+            parts = data.split("_")
+            if len(parts) >= 3:
+                slot_appt_id = parts[1]
+                waitlist_id = parts[2]
+                try:
+                    client = get_supabase()
+                    
+                    slot = client.table("appointments").select("*").eq("id", slot_appt_id).eq("status", "CANCELLED").execute()
+                    
+                    if slot.data:
+                        patient = client.table("patients").select("*").eq("chat_id", chat_id).limit(1).execute()
+                        patient_name = "Patient"
+                        if patient.data:
+                            patient_name = patient.data[0].get("first_name", "Patient")
+                        
+                        client.table("appointments").update({
+                            "status": "CONFIRMED",
+                            "confirmed": True,
+                            "patient_name": patient_name,
+                            "phone": chat_id,
+                            "source": "recovery"
+                        }).eq("id", slot_appt_id).execute()
+                        
+                        client.table("waitlist").update({"status": "claimed"}).eq("id", waitlist_id).execute()
+                        
+                        tg.send_message(chat_id, "✅ ቦታውን ይዘዋል! ቀጠሮዎ ተረጋግጧል። እናመሰግናለን!")
+                        
+                        tg.send_message(OWNER_CHAT_ID, f'💰 Slot claimed! Revenue recovered.')
+                    else:
+                        tg.send_message(chat_id, "⚠️ ይቅርታ፣ ቦታው ቀድሞ ተወስዷል። ሌላ ቀጠሮ ሲገኝ እናሳውቅዎታለን።")
+                    
+                except Exception as e:
+                    logger.error(f"claim error: {e}")
+            return
 
         # --- Confirm appointment ---
         if data.startswith("confirm_"):
@@ -499,8 +613,15 @@ def _handle_callback_query(callback_query: dict) -> None:
             appt_id = data.replace("cancel_", "")
             try:
                 client = get_supabase()
-                client.table("appointments").update({"status": "CANCELLED"}).eq("id", appt_id).execute()
-                tg.send_message(chat_id, "❌ ቀጠሮዎ ተሰርዟል። ሌላ ቀጠሮ ለማስያዝ ክሊኒኩን ያነጋግሩ።")
+                
+                cancelled = client.table("appointments").select("*").eq("id", appt_id).execute()
+                if cancelled.data:
+                    cancelled_appt = cancelled.data[0]
+                    
+                    client.table("appointments").update({"status": "CANCELLED"}).eq("id", appt_id).execute()
+                    tg.send_message(chat_id, "❌ ቀጠሮዎ ተሰርዟል። ሌላ ቀጠሮ ለማስያዝ ክሊኒኩን ያነጋግሩ።")
+                    
+                    _recover_slot(client, cancelled_appt)
             except Exception as e:
                 logger.error(f"cancel error: {e}")
             return
